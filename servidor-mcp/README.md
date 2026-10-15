@@ -27,8 +27,9 @@ Para reiniciar durante uma elicitation, mantenha o **mesmo valor** de
 
 A descoberta `server/discover` declara `tools` e `resources`. As ferramentas sao
 `listar_salas`, `consultar_disponibilidade` e `reservar_sala`. O resource
-`politica://uso` devolve o Markdown literal. Os schemas publicados acompanham
-`exemplos/wire/01-tools-list.json`; os resultados completos incluem JSON em
+`politica://uso` devolve o Markdown literal. Os schemas publicados descrevem os
+mesmos campos e tipos de `exemplos/wire/01-tools-list.json`, com a apresentacao
+padrao do FastMCP; os resultados completos incluem JSON em
 `structuredContent` e em um bloco de texto, alem de `resultType: complete`.
 
 Cada POST exige os dois campos reservados em `params._meta`: protocolVersion e
@@ -107,14 +108,21 @@ Um header legado `2025-11-25` podia selecionar o caminho legado mesmo com
 O middleware compara metadados e headers antes desse roteamento e devolve o
 `-32020` exigido pelo contrato; o restante do protocolo continua no SDK.
 
-O FastMCP tambem comprime automaticamente schemas gerados e acrescenta titulos e
-metadados de apresentacao. `FerramentaWire` publica os schemas explicitos dos
-modelos Pydantic e remove esses extras para reproduzir a descoberta do wire 01.
+As tools usam o decorator padrao `@mcp.tool()`. O FastMCP gera os schemas a partir
+das anotacoes de tipo dos parametros e do retorno, e usa a docstring como
+descricao. Os modelos Pydantic descrevem os dados retornados. O parametro
+`ctx: Context` e injetado pelo framework e nao aparece nos argumentos publicos.
+
+Nao ha registro personalizado de tools nem ajuste manual dos schemas. Titulos,
+metadados e o uso de referencias ou objetos inline seguem o padrao do FastMCP.
+Os testes comparam os campos e tipos do contrato sem exigir a mesma apresentacao
+do exemplo wire. O middleware usa `BaseHTTPMiddleware` do Starlette para ler o
+corpo sem precisar implementar sua retransmissao ao SDK.
 
 ## Validacao realizada
 
-Em 13/10/2026: **14 testes automatizados PASS**, **20/20 checks MCP PASS**,
-retry apos reiniciar o processo PASS e inspecao automatizada de stderr PASS.
-O ciclo inicial de testes falhou pela ausencia do servidor; a implementacao foi
-adicionada e ajustada ate o contrato passar. `dados/`, `validador/`, `exemplos/`
-e `agente/` permaneceram inalterados.
+Na refatoracao de 14/10/2026: **20 testes automatizados PASS**, **20/20 checks MCP
+PASS**, retry apos reiniciar o processo PASS e inspecao automatizada de stderr
+PASS. O novo teste de descoberta falhou primeiro porque o schema personalizado
+nao declarava a rejeicao de argumentos desconhecidos; o schema padrao passou.
+`dados/`, `validador/`, `exemplos/` e `agente/` permaneceram inalterados.

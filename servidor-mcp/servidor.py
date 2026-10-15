@@ -7,12 +7,12 @@ import sys
 
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
-from fastmcp.tools.function_tool import FunctionTool
 from mcp import MCPError
 from mcp.server.request_state import RequestStateSecurity
 from mcp.types import ElicitRequest, ElicitRequestFormParams, ElicitResult, InputRequiredResult
 from pydantic import BaseModel
 from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 import uvicorn
@@ -57,26 +57,15 @@ class ReservaOut(BaseModel):
     motivo: str | None = None
 
 
-class FerramentaWire(FunctionTool):
-    """Mantem a descoberta no formato do contrato, sem metadados extras do framework."""
-
-    def to_mcp_tool(self, **overrides):
-        return super().to_mcp_tool(**{'title': None, '_meta': None, **overrides})
-
-
-class RegistrarRequests:
+class RegistrarRequests(BaseHTTPMiddleware):
     """Observa o corpo antes das validacoes do SDK, inclusive requests recusados."""
 
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope['type'] != 'http' or scope['method'] != 'POST':
-            return await self.app(scope, receive, send)
-        raw = await Request(scope, receive).body()
+    async def dispatch(self, request: Request, call_next):
+        if request.method != 'POST':
+            return await call_next(request)
         body, params, meta = None, None, None
         try:
-            body = json.loads(raw)
+            body = await request.json()
             params = body.get('params') or {}
             meta = params.get('_meta') or {}
             log = {'method': body.get('method'), 'id': body.get('id'),
@@ -93,27 +82,16 @@ class RegistrarRequests:
             if version_key not in meta or caps_key not in meta:
                 error = (-32602, 'protocolVersion e clientCapabilities obrigatorios em params._meta')
             else:
-                headers = Request(scope).headers
                 mirrors = {'MCP-Protocol-Version': meta[version_key],
                            'Mcp-Method': body.get('method')}
                 if body.get('method') in ('tools/call', 'resources/read'):
                     mirrors['Mcp-Name'] = params.get('name', params.get('uri'))
-                if any(headers.get(name) != value for name, value in mirrors.items()):
+                if any(request.headers.get(name) != value for name, value in mirrors.items()):
                     error = (-32020, 'Headers de transporte divergem do corpo')
             if error:
-                response = JSONResponse({'jsonrpc': '2.0', 'id': body.get('id'),
+                return JSONResponse({'jsonrpc': '2.0', 'id': body.get('id'),
                     'error': {'code': error[0], 'message': error[1]}}, status_code=400)
-                return await response(scope, receive, send)
-        consumed = False
-
-        async def replay():
-            nonlocal consumed
-            if not consumed:
-                consumed = True
-                return {'type': 'http.request', 'body': raw, 'more_body': False}
-            return await receive()
-
-        await self.app(scope, replay, send)
+        return await call_next(request)
 
 
 def criar_app(secret: str | None = None):
@@ -181,34 +159,23 @@ def criar_app(secret: str | None = None):
         reservas.append(reserva)
         return ReservaOut(reserva=reserva['id'], **args, politica=versao)
 
-    def ferramenta(output_model, description):
-        def register(fn):
-            tool = FerramentaWire.from_function(fn, description=description,
-                output_schema=output_model.model_json_schema())
-            properties = tool.parameters['properties']
-            tool.parameters = {'type': 'object', 'properties': {
-                name: {**schema, 'title': name.capitalize()}
-                for name, schema in properties.items()}, 'title': fn.__name__ + 'Arguments'}
-            if properties:
-                tool.parameters['required'] = list(properties)
-            mcp.add_tool(tool)
-            return fn
-        return register
-
-    @ferramenta(ListaDeSalas, description='Lista todas as salas com capacidade e recursos.')
+    @mcp.tool()
     async def listar_salas() -> ListaDeSalas:
+        """Lista todas as salas com capacidade e recursos."""
         return ListaDeSalas(salas=salas)
 
-    @ferramenta(Disponibilidade, description='Diz se uma sala esta livre no intervalo, e quais reservas conflitam.')
+    @mcp.tool()
     async def consultar_disponibilidade(sala: str, inicio: str, fim: str) -> Disponibilidade:
+        """Diz se uma sala esta livre no intervalo, e quais reservas conflitam."""
         start, end = validar(sala, inicio, fim)
         found = conflitos(sala, start, end)
         return Disponibilidade(sala=sala, livre=not found,
                                conflitos=[ConflitoOut(**r) for r in found])
 
-    @ferramenta(ReservaOut, description='Reserva uma sala. Se o intervalo estiver ocupado, pergunta qual alternativa usar.')
+    @mcp.tool()
     async def reservar_sala(sala: str, inicio: str, fim: str, responsavel: str,
                            ctx: Context) -> ReservaOut | InputRequiredResult:
+        """Reserva uma sala. Se o intervalo estiver ocupado, pergunta qual alternativa usar."""
         args = dict(sala=sala, inicio=inicio, fim=fim, responsavel=responsavel)
         if ctx.request_state is not None:
             # O SDK ja verificou AEAD, expiração, audience, metodo, tool e args.

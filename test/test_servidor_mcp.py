@@ -92,11 +92,47 @@ class ServidorTest(unittest.TestCase):
         _, body = await self.request('tools/list')
         expected = json.loads((Path(__file__).resolve().parents[1] /
             'exemplos/wire/01-tools-list.json').read_text())['response']['body']['result']['tools']
-        self.assertEqual(body['result']['tools'], expected)
+
+        def estrutura(schema, root):
+            # Titulos e a escolha entre $ref e schema inline nao mudam os dados aceitos.
+            if isinstance(schema, list):
+                return [estrutura(item, root) for item in schema]
+            if not isinstance(schema, dict):
+                return schema
+            if '$ref' in schema:
+                return estrutura(root['$defs'][schema['$ref'].split('/')[-1]], root)
+            return {key: estrutura(value, root) for key, value in schema.items()
+                    if key not in ('title', '$defs')}
+
+        tools = {tool['name']: tool for tool in body['result']['tools']}
+        self.assertEqual(set(tools), {tool['name'] for tool in expected})
+        for example in expected:
+            tool = tools[example['name']]
+            with self.subTest(tool=tool['name']):
+                self.assertEqual(tool['description'], example['description'])
+                for field in ('type', 'properties', 'required'):
+                    self.assertEqual(
+                        estrutura(tool['inputSchema'].get(field, []), tool['inputSchema']),
+                        estrutura(example['inputSchema'].get(field, []), example['inputSchema']))
+                self.assertEqual(estrutura(tool['outputSchema'], tool['outputSchema']),
+                                 estrutura(example['outputSchema'], example['outputSchema']))
         _, body = await self.call('listar_salas')
         result = body['result']
         self.assertEqual(json.loads(result['content'][0]['text']), result['structuredContent'])
         self.assertEqual(len(result['structuredContent']['salas']), 5)
+
+    async def test_discovery_declares_only_accepted_arguments(self):
+        _, body = await self.request('tools/list')
+        for tool in body['result']['tools']:
+            with self.subTest(tool=tool['name']):
+                schema = tool['inputSchema']
+                self.assertNotIn('ctx', schema['properties'])
+                self.assertIs(schema.get('additionalProperties'), False)
+                _, response = await self.call(tool['name'], {
+                    **{name: argumentos()[name] for name in schema['properties']},
+                    'argumento_desconhecido': 'valor',
+                })
+                self.assertTrue(response['result']['isError'])
 
     async def test_required_meta_on_every_request(self):
         for method, params in [('tools/list', {}), ('tools/call', {'name': 'listar_salas'}),
