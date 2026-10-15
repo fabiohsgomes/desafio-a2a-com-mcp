@@ -34,20 +34,21 @@ Encerre os serviços com `Ctrl+C`. Antes de repetir a validação, reinicie ambo
 
 ## Onde a ponte acontece
 
-Em [`agente/main.py`](agente/main.py), `HostMCP.reservar` chama `call_tool` com `allow_input_required=True`. `CentralDeSalas.resultado` reconhece `resultType == "input_required"`, guarda o token em `Tarefa.request_state` e chama `CentralDeSalas.pausar`, que define `TASK_STATE_INPUT_REQUIRED` e apresenta as alternativas. Na continuação de `SendMessage`, `CentralDeSalas.enviar` envia os argumentos originais, `input_responses` com a chave da pergunta e o mesmo `request_state` para `HostMCP.reservar`; o SDK serializa esses campos como `inputResponses` e `requestState` no novo `tools/call`. Em [`servidor-mcp/servidor.py`](servidor-mcp/servidor.py), `reservar_sala` recebe o estado já validado pelo SDK em `ctx.request_state`, processa a resposta e revalida a disponibilidade antes de criar a reserva.
+Em [`agente/main.py`](agente/main.py), `HostMCP.reservar` chama `call_tool` com `allow_input_required=True` e devolve os modelos `types.CallToolResult` ou `types.InputRequiredResult` do SDK. `CentralDeSalas.resultado` reconhece a pausa por `isinstance(result, types.InputRequiredResult)` (equivalente a `resultType: "input_required"` no protocolo), valida a pergunta como `ElicitRequest` em modo form, guarda `result.request_state` em `Tarefa.request_state` e chama `estado` diretamente para definir `TASK_STATE_INPUT_REQUIRED` e apresentar as alternativas. Na continuação de `SendMessage`, `CentralDeSalas.enviar` delega a `continuar`, que valida a escolha e monta a resposta à pergunta; `CentralDeSalas.reservar` envia os argumentos originais, `input_responses` com a chave da pergunta e o mesmo `request_state` para `HostMCP.reservar`. O SDK serializa esses campos como `inputResponses` e `requestState` no novo `tools/call`. Em [`servidor-mcp/servidor.py`](servidor-mcp/servidor.py), `reservar_sala`, registrada com `@mcp.tool()`, recebe o estado já validado pelo SDK em `ctx.request_state`, processa a resposta e revalida a disponibilidade em `criar_reserva` antes de inserir a reserva.
 
 ## Decisões técnicas
 
+- **Validação e tipos:** `CentralDeSalas.enviar` valida a entrada A2A com os modelos Pydantic `MensagemUsuario` e `ParteTexto` em modo estrito. Os resultados MCP permanecem nos modelos do SDK durante o processamento, com acesso a campos como `input_requests`, `request_state` e `structured_content`; a serialização pública da Task continua separada em `wire`.
 - **Proteção do `requestState`:** `criar_app` configura `RequestStateSecurity` do SDK MCP com AES-256-GCM e segredo de pelo menos 32 bytes vindo de `REQUEST_STATE_SECRET`. O SDK autentica e cifra o estado, vinculando-o à audiência `central-de-salas`, ao método, à ferramenta e aos argumentos originais. Tokens adulterados, expirados ou reutilizados com argumentos divergentes são rejeitados com `-32602`. O agente trata o token como opaco: guarda e devolve sem interpretá-lo, mantém-o fora do objeto público `wire` e não o registra nos logs.
 - **Validade:** `ttl=600`, isto é, **10 minutos a partir da emissão**. O token contém o pedido, as alternativas e a chave da pergunta; o MCP não mantém pedidos pendentes em memória. Ele pode retomar uma pausa após reiniciar o servidor, dentro desse prazo, desde que o segredo seja preservado. As reservas concluídas ficam em memória e são recarregadas dos fixtures ao reiniciar.
 - **Estado das Tasks:** `CentralDeSalas.tasks` é um dicionário em memória no processo do agente, indexado pelo ID da Task. Cada `Tarefa` contém o estado público, histórico, argumentos originais, token privado e um `asyncio.Lock` próprio para serializar continuações. `GetTask` devolve uma cópia do estado público. Não há persistência: reiniciar o agente perde as Tasks, inclusive as pausadas.
 
 ## Saída do validador
 
-Última execução em **13/10/2026**, com ambos os processos recém-iniciados e o comando de validação acima: **36 verificações passaram, nenhuma falhou; código de saída 0**. Saída completa:
+Última execução em **14/10/2026**, com ambos os processos recém-iniciados e o comando de validação acima: **36 verificações passaram, nenhuma falhou; código de saída 0**. Saída completa:
 
 ```text
-trace-id desta execucao: 987a1f7d78ee4858d809ad34646d9e18
+trace-id desta execucao: a17e575f81e2f5d993120ae7e44e510a
 procure esse valor no stderr do servidor MCP para conferir a propagacao do traceparent.
 
 PASS 01 tools/list traz as tres tools
