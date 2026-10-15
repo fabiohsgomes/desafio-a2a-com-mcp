@@ -7,12 +7,14 @@ import json
 import logging
 import os
 import re
+from typing import Literal
 from uuid import uuid4
 
 import httpx2
 from mcp import types
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -22,7 +24,9 @@ import uvicorn
 LOGGER = logging.getLogger('central-de-salas')
 PROTOCOL_VERSION = '2026-07-28'
 TERMINAIS = {'TASK_STATE_COMPLETED', 'TASK_STATE_CANCELED', 'TASK_STATE_FAILED'}
-PEDIDO = re.compile(r'reservar sala=(\S+) inicio=(\S+) fim=(\S+) responsavel=(.+)', re.DOTALL)
+PEDIDO = re.compile(
+    r'reservar sala=(?P<sala>\S+) inicio=(?P<inicio>\S+) '
+    r'fim=(?P<fim>\S+) responsavel=(?P<responsavel>.+)', re.DOTALL)
 
 
 def registrar(protocolo, metodo, request_id, trace):
@@ -49,12 +53,8 @@ class HostMCP:
 
     @staticmethod
     def meta(trace):
-        # O SDK espelha versao e nome nos headers e repete capabilities em cada POST.
-        meta = {'io.modelcontextprotocol/protocolVersion': PROTOCOL_VERSION,
-                'io.modelcontextprotocol/clientCapabilities': {'elicitation': {'form': {}}}}
-        if trace:
-            meta['traceparent'] = trace
-        return meta
+        # O SDK acrescenta versao, capabilities e headers em cada POST.
+        return {'traceparent': trace} if trace else {}
 
     async def descobrir(self, trace):
         async with self.discovery_lock:
@@ -83,13 +83,13 @@ class HostMCP:
             raise RuntimeError('Resource de politica sem versao na primeira linha')
         return match.group(1).strip()
 
-    async def reservar(self, args, trace, input_responses=None, request_state=None):
+    async def reservar(self, args, trace, input_responses=None,
+                       request_state=None) -> types.CallToolResult | types.InputRequiredResult:
         await self.descobrir(trace)
-        result = await self.session.call_tool(
+        return await self.session.call_tool(
             'reservar_sala', args, meta=self.meta(trace),
             input_responses=input_responses, request_state=request_state,
             allow_input_required=True)
-        return result.model_dump(by_alias=True, mode='json', exclude_none=True)
 
 
 class RpcError(Exception):
@@ -97,6 +97,21 @@ class RpcError(Exception):
         self.code = code
         self.message = message
         super().__init__(message)
+
+
+class ParteTexto(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    text: str
+
+
+class MensagemUsuario(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    role: Literal['ROLE_USER']
+    messageId: str
+    parts: list[ParteTexto] = Field(min_length=1)
+    taskId: str | None = None
 
 
 @dataclass
@@ -129,33 +144,34 @@ class CentralDeSalas:
         task.wire['status'] = {'state': state, 'message': message}
         task.wire['history'].append(message)
 
-    def pausar(self, task):
-        self.estado(task, 'TASK_STATE_INPUT_REQUIRED',
-                    'alternativas: ' + ', '.join(task.alternativas))
-
-    async def resultado(self, task, result, declined=False):
-        if result.get('resultType') == 'input_required':
-            requests = result.get('inputRequests') or {}
-            if len(requests) != 1 or result.get('requestState') is None:
+    def resultado(self, task, result: types.CallToolResult | types.InputRequiredResult,
+                  declined=False):
+        if isinstance(result, types.InputRequiredResult):
+            requests = result.input_requests or {}
+            if len(requests) != 1 or result.request_state is None:
                 raise ValueError('Elicitation inesperada')
             key, question = next(iter(requests.items()))
-            choices = question['params']['requestedSchema']['properties']['sala']['enum']
+            if not isinstance(question, types.ElicitRequest) or not isinstance(
+                    question.params, types.ElicitRequestFormParams):
+                raise ValueError('Esperada elicitation em modo form')
+            choices = question.params.requested_schema['properties']['sala']['enum']
             if not isinstance(choices, list) or not all(isinstance(x, str) for x in choices):
                 raise ValueError('Enum invalido')
             task.input_key = key
             task.alternativas = choices
-            task.request_state = result['requestState']  # Opaco: somente guardar e ecoar.
-            self.pausar(task)
+            task.request_state = result.request_state  # Opaco: somente guardar e ecoar.
+            self.estado(task, 'TASK_STATE_INPUT_REQUIRED',
+                        'alternativas: ' + ', '.join(task.alternativas))
             return
-        if result.get('isError'):
-            text = '\n'.join(part['text'] for part in result.get('content', []) if 'text' in part)
+        if result.is_error:
+            text = '\n'.join(part.text for part in result.content if isinstance(part, types.TextContent))
             self.estado(task, 'TASK_STATE_FAILED', text)
         elif declined:
             self.estado(task, 'TASK_STATE_CANCELED', 'Reserva recusada')
         else:
-            data = result.get('structuredContent')
+            data = result.structured_content
             if data is None:
-                data = json.loads(next(p['text'] for p in result['content'] if 'text' in p))
+                data = json.loads(next(p.text for p in result.content if isinstance(p, types.TextContent)))
             reservation = {**data, 'politica': task.politica}
             task.wire['artifacts'] = [{'artifactId': str(uuid4()), 'name': 'reserva',
                 'parts': [{'text': json.dumps(reservation, ensure_ascii=False)}]}]
@@ -165,16 +181,19 @@ class CentralDeSalas:
         task.alternativas = []
 
     async def enviar(self, message, trace):
-        if not isinstance(message, dict) or message.get('role') != 'ROLE_USER':
-            raise RpcError(-32602, 'Esperada mensagem ROLE_USER')
-        parts = message.get('parts')
-        if (not isinstance(message.get('messageId'), str) or not isinstance(parts, list)
-                or not parts or any(not isinstance(p, dict) or not isinstance(p.get('text'), str) for p in parts)):
-            raise RpcError(-32602, 'Mensagem deve conter messageId e parts de texto')
-        text = ' '.join(p['text'] for p in parts)
-        task_id = message.get('taskId')
-        user = {'messageId': message['messageId'], 'role': 'ROLE_USER',
-                'parts': [{'text': p['text']} for p in parts]}
+        try:
+            message = MensagemUsuario.model_validate(message)
+        except ValidationError as exc:
+            fields = [error['loc'] for error in exc.errors(include_input=False)]
+            # Preserva a prioridade e as mensagens de erro do contrato A2A.
+            if any(loc in ((), ('role',)) for loc in fields):
+                raise RpcError(-32602, 'Esperada mensagem ROLE_USER') from None
+            if any(loc[0] != 'taskId' for loc in fields):
+                raise RpcError(-32602, 'Mensagem deve conter messageId e parts de texto') from None
+            raise RpcError(-32001, 'Task inexistente') from None
+        text = ' '.join(part.text for part in message.parts)
+        task_id = message.taskId
+        user = message.model_dump(exclude={'taskId'})
         if task_id is not None:
             self.obter(task_id)
             task = self.tasks[task_id]
@@ -194,42 +213,47 @@ class CentralDeSalas:
                 task.trace = trace
             task.wire['history'].append(user)
             if task.request_state is not None:
-                choice = text.removeprefix('escolha=') if text.startswith('escolha=') else None
-                if choice != 'recusar' and choice not in task.alternativas:
-                    # Preserve a mensagem da pausa byte a byte, inclusive no status.
-                    return self.obter(task_id)
-                declined = choice == 'recusar'
-                answer = {'action': 'decline'} if declined else {
-                    'action': 'accept', 'content': {'sala': choice}}
-                self.estado(task, 'TASK_STATE_WORKING', 'TASK_STATE_WORKING')
-                try:
-                    result = await self.host.reservar(task.arguments, task.trace,
-                        input_responses={task.input_key: answer}, request_state=task.request_state)
-                    await self.resultado(task, result, declined)
-                except Exception as exc:
-                    self.falha_host(task, exc)
+                await self.continuar(task, text)
             else:
-                await asyncio.sleep(0)
-                self.estado(task, 'TASK_STATE_WORKING', 'TASK_STATE_WORKING')
-                match = PEDIDO.fullmatch(text)
-                if not match:
-                    self.estado(task, 'TASK_STATE_FAILED',
-                        'Pedido invalido: reservar sala=<id> inicio=<iso8601> fim=<iso8601> responsavel=<nome>')
-                else:
-                    task.arguments = dict(zip(('sala', 'inicio', 'fim', 'responsavel'), match.groups()))
-                    try:
-                        task.politica = await self.host.politica(task.trace)
-                        result = await self.host.reservar(task.arguments, task.trace)
-                        await self.resultado(task, result)
-                    except Exception as exc:
-                        self.falha_host(task, exc)
+                await self.iniciar(task, text)
         return self.obter(task_id)
 
-    def falha_host(self, task, exc):
-        # Erros de transporte/protocolo nao expoem o payload ou token opaco.
-        LOGGER.error('Falha MCP task=%s tipo=%s', task.wire['id'], type(exc).__name__)
-        self.estado(task, 'TASK_STATE_FAILED', 'Falha ao comunicar com o servidor MCP')
-        task.request_state = None
+    async def iniciar(self, task, text):
+        """Interpreta o pedido inicial; as regras de reserva ficam no MCP."""
+        await asyncio.sleep(0)  # Permite que GetTask observe SUBMITTED.
+        self.estado(task, 'TASK_STATE_WORKING', 'TASK_STATE_WORKING')
+        match = PEDIDO.fullmatch(text)
+        if not match:
+            self.estado(task, 'TASK_STATE_FAILED',
+                'Pedido invalido: reservar sala=<id> inicio=<iso8601> fim=<iso8601> responsavel=<nome>')
+            return
+        task.arguments = match.groupdict()
+        await self.reservar(task)
+
+    async def continuar(self, task, text):
+        """Traduz a escolha em resposta a pergunta recebida do MCP."""
+        choice = text.removeprefix('escolha=') if text.startswith('escolha=') else None
+        if choice != 'recusar' and choice not in task.alternativas:
+            return  # Mantem a mensagem e o status da pausa byte a byte.
+        answer = {'action': 'decline'} if choice == 'recusar' else {
+            'action': 'accept', 'content': {'sala': choice}}
+        self.estado(task, 'TASK_STATE_WORKING', 'TASK_STATE_WORKING')
+        await self.reservar(task, answer)
+
+    async def reservar(self, task, answer=None):
+        """Executa o pedido ou retry e trata falhas sem expor dados privados."""
+        try:
+            if answer is None:
+                task.politica = await self.host.politica(task.trace)
+            result = await self.host.reservar(
+                task.arguments, task.trace,
+                input_responses={task.input_key: answer} if answer is not None else None,
+                request_state=task.request_state)
+            self.resultado(task, result, declined=answer is not None and answer['action'] == 'decline')
+        except Exception as exc:
+            LOGGER.error('Falha MCP task=%s tipo=%s', task.wire['id'], type(exc).__name__)
+            self.estado(task, 'TASK_STATE_FAILED', 'Falha ao comunicar com o servidor MCP')
+            task.request_state = None
 
 
 async def log_mcp(request):

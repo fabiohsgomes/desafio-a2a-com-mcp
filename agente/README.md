@@ -69,16 +69,36 @@ chamada e guarda os nomes descobertos. `HostMCP.politica` lê `politica://uso`
 para cada Task e extrai a versão da primeira linha. `SessaoForm` anuncia
 `elicitation.form` sem registrar callback: o SDK 2.3.0 condiciona seu anúncio
 automático à presença de um callback, então a subclasse adapta somente esse
-anúncio. A versão MCP explícita do contrato é `2026-07-28`; cada POST leva
-metadados completos e os headers espelhados pelo SDK, sem handshake legado.
+anúncio. A versão MCP explícita do contrato é `2026-07-28`. O agente informa
+apenas o trace nos metadados de cada chamada; o SDK acrescenta versão,
+capabilities e headers espelhados em cada POST, sem handshake legado.
 
-`HostMCP.reservar` usa `call_tool(..., allow_input_required=True)`. Em
-`CentralDeSalas.resultado`, o retorno bruto `input_required` vira
-`TASK_STATE_INPUT_REQUIRED`, com `alternativas: ...` na ordem do enum.
+`CentralDeSalas.enviar` valida a mensagem, localiza ou cria a Task e encaminha
+o texto para um de dois métodos:
+
+- `iniciar` interpreta o pedido com grupos nomeados na expressão regular.
+- `continuar` valida a escolha e prepara a resposta à pergunta do MCP.
+
+`MensagemUsuario` e `ParteTexto` usam Pydantic em modo estrito para declarar
+os campos obrigatórios e os tipos aceitos, incluindo uma lista não vazia de
+partes de texto. Os erros de validação são traduzidos para os mesmos códigos
+e mensagens A2A existentes; campos extras continuam sendo ignorados.
+O conteúdo público da mensagem é serializado a partir do modelo validado.
+`Tarefa` continua como `dataclass`, pois guarda estado interno e um lock.
+
+Os métodos `iniciar` e `continuar` usam `CentralDeSalas.reservar`, que lê a política no pedido inicial,
+executa a chamada MCP e trata as falhas de comunicação em um único lugar.
+
+`HostMCP.reservar` usa `call_tool(..., allow_input_required=True)` e mantém os
+objetos tipados `CallToolResult` e `InputRequiredResult` do SDK, sem convertê-los
+em dicionários. Em
+`CentralDeSalas.resultado`, um método síncrono que atualiza a Task, o retorno
+bruto `input_required` vira `TASK_STATE_INPUT_REQUIRED`, com `alternativas: ...`
+na ordem do enum.
 O `requestState` é guardado sem interpretação em `Tarefa.request_state`,
 fora do objeto público da Task. A chave da pergunta também fica nessa Task.
 
-Em `CentralDeSalas.enviar`, uma continuação válida repete os argumentos
+Na continuação, a rotina comum de reserva repete os argumentos
 originais e envia `input_responses` com a mesma chave, mais `request_state`
 inalterado. O SDK gera um novo ID JSON-RPC. Escolha inválida mantém a pausa;
 recusa conclui em `CANCELED`; erro de execução conserva o texto exato da tool
@@ -97,7 +117,12 @@ não expor payload interno; não há retry automático que duplique reservas.
 
 ## Verificação
 
-Testes automatizados, incluindo a ponte e os testes preexistentes do servidor:
+Testes automatizados, incluindo a ponte e os testes preexistentes do servidor.
+Os cenários do agente cobrem também continuações simultâneas sem duplicar a
+reserva, falhas de comunicação sem expor o token e mensagens malformadas sem
+consultar o MCP. Os testes usam os mesmos tipos de resultado do SDK e verificam
+a preservação dos erros, múltiplas partes de texto, campos extras e a conclusão
+com JSON no bloco de texto quando não há `structuredContent`:
 
 ```sh
 uv run --frozen python -m unittest discover -s test -v
@@ -121,11 +146,15 @@ Para serviços iniciados manualmente, reinicie ambos antes de cada execução:
 uv run --frozen python validador/validar.py --agente http://localhost:7300 --mcp http://localhost:7301
 ```
 
-Validação em 13/10/2026: **36/36 checks PASS**, com descoberta, IDs e trace
-confirmados nos logs dos dois processos. Exemplo observado no stderr MCP:
+Validação da refatoração em 14/10/2026: **27 testes automatizados PASS**
+(incluindo **12 testes do agente**) e **36/36 checks PASS**, com descoberta,
+IDs e trace confirmados nos logs dos dois processos. O servidor aceitou os
+requests após a simplificação dos metadados, mantendo a validação obrigatória
+de versão, capabilities e headers. Exemplo observado anteriormente no stderr MCP:
 
 ```json
 {"method":"tools/call","traceparent":"00-1dd494554058476db6df05766f04b092-e6539e5161ffd36a-01"}
 ```
 
-`servidor-mcp/`, `dados/`, `validador/` e `exemplos/` não foram alterados.
+Nesta refatoração do agente, `servidor-mcp/`, `dados/`, `validador/` e
+`exemplos/` não foram alterados.
